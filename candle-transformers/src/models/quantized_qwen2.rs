@@ -410,7 +410,10 @@ impl ModelWeights {
                 layer_stats(index_pos, li, "attn", &attn)?;
             }
             let x = (attn + residual)?;
-            if kv_sync && li < 2 {
+            // Decode-side crossings are rescued by syncing the first two
+            // layers alone; prefill-side crossings (the crossing chunk of a
+            // long prompt) empirically need the sync on every layer.
+            if kv_sync && (li < 2 || seq_len > 1) {
                 x.device().synchronize()?;
             }
 
