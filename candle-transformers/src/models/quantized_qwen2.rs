@@ -157,15 +157,14 @@ pub struct ModelWeights {
     span_output: tracing::Span,
 }
 
-/// True when this forward's KV positions cross a multiple of 8,192 — the
-/// depths at which the K/V cache byte size passes an exact power of two and
-/// Metal generation corrupts without a forced sync (see `forward`).
-fn crosses_kv_boundary(index_pos: usize, seq_len: usize) -> bool {
-    const STRIDE: usize = 8_192;
-    let end = index_pos + seq_len; // kv length after this forward
-    // The crossing step itself, plus the step that starts exactly on the
-    // boundary — together the two steps the bisection proved sufficient.
-    (index_pos / STRIDE) != (end / STRIDE) || (index_pos % STRIDE == 0 && index_pos != 0)
+/// True when this forward's KV positions extend past the depth at which
+/// Metal generation corrupts without forced syncs (see `forward`). 8,192 is
+/// where the K/V cache byte size first passes an exact power of two and the
+/// first depth observed to corrupt; deeper work corrupts too, so everything
+/// past the threshold is treated as hazardous.
+fn past_kv_threshold(index_pos: usize, seq_len: usize) -> bool {
+    const THRESHOLD: usize = 8_192;
+    index_pos + seq_len >= THRESHOLD
 }
 
 /// Debug probe (`CANDLE_QWEN2_LAYER_STATS=<lo>-<hi>`): true when the KV
@@ -390,16 +389,18 @@ impl ModelWeights {
         };
         let _enter = self.span.enter();
         let probe = layer_stats_enabled(index_pos, index_pos + seq_len);
-        // Workaround for deterministic Metal corruption when the KV depth
-        // crosses a multiple of 8,192: without a forced sync early in the
-        // crossing step, generation degrades into garbage from that position
-        // on (a missed dependency under HazardTrackingModeUntracked; the
-        // fixed encoder schedule makes the stale read deterministic).
-        // Empirically, synchronizing after the first two layers' outputs of
-        // the crossing step fully restores correct generation; steps that
-        // don't cross a boundary are untouched. See yatima's
-        // notes/metal-kv-cliff.md for the bisection.
-        let kv_sync = x.device().is_metal() && crosses_kv_boundary(index_pos, seq_len);
+        // Workaround for deterministic Metal corruption once the KV depth
+        // passes 8,192: without forced syncs, generation degrades into
+        // garbage (a missed dependency under HazardTrackingModeUntracked;
+        // the mostly-fixed encoder schedule makes the stale read look
+        // deterministic). Syncing only the boundary-crossing steps proved
+        // insufficient in deeper water (clean through a ~15.5k-token
+        // prefill, garbage at ~18k, past the 16,384 = 2^26-byte cache
+        // crossing), so every forward that extends past the threshold is
+        // synced: all layers for prefill chunks, the first two layers for
+        // decode steps (the bisection-proven decode minimum). Shallow
+        // contexts are untouched. See yatima's notes/metal-kv-cliff.md.
+        let kv_sync = x.device().is_metal() && past_kv_threshold(index_pos, seq_len);
         let mut layer_in = self.tok_embeddings.forward(x)?;
         for (li, layer) in self.layers.iter_mut().enumerate() {
             let x = layer_in;
