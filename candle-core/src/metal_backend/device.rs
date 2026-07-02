@@ -470,6 +470,9 @@ mod tests {
 }
 
 fn find_available_buffer(size: usize, buffers: &BufferMap) -> Option<Arc<Buffer>> {
+    if pool_reuse_disabled(size) {
+        return None;
+    }
     let mut best_buffer: Option<&Arc<Buffer>> = None;
     let mut best_buffer_size = usize::MAX;
     for (buffer_size, subbuffers) in buffers.iter() {
@@ -482,5 +485,39 @@ fn find_available_buffer(size: usize, buffers: &BufferMap) -> Option<Arc<Buffer>
             }
         }
     }
+    if let Some(b) = best_buffer {
+        alloc_log(size, best_buffer_size, Some(b));
+    }
     best_buffer.cloned()
+}
+
+/// Debug kill-switch: `CANDLE_METAL_NO_REUSE_POW2=1` disables buffer-pool
+/// reuse for exact power-of-two requests ≥ 16 MiB, so those allocations get
+/// fresh `MTLBuffer`s. Used to discriminate pool-reuse races from compute
+/// bugs at the KV-cache power-of-two crossings (e.g. a 32 MiB K/V cache at
+/// position 8,192) without the unbounded memory growth of disabling reuse
+/// globally — the affected class is a few hundred buffers per run.
+fn pool_reuse_disabled(size: usize) -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("CANDLE_METAL_NO_REUSE_POW2").is_some())
+        && size >= (1 << 24)
+        && size.is_power_of_two()
+}
+
+/// Debug tracing: `CANDLE_METAL_ALLOC_LOG=<min_bytes>` logs pool reuse of
+/// buffers at least `min_bytes` big (buffer pointer included, so a reused
+/// buffer can be correlated with its previous life).
+fn alloc_log(size: usize, bucket: usize, buffer: Option<&Arc<Buffer>>) {
+    static MIN: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let min = MIN.get_or_init(|| {
+        std::env::var("CANDLE_METAL_ALLOC_LOG")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    });
+    if let Some(min) = min {
+        if size >= *min {
+            let ptr = buffer.map(|b| Arc::as_ptr(b) as usize).unwrap_or(0);
+            eprintln!("[metal-alloc] reuse size={size} bucket={bucket} buf={ptr:#x}");
+        }
+    }
 }
