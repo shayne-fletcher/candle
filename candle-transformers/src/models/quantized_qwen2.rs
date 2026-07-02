@@ -157,6 +157,73 @@ pub struct ModelWeights {
     span_output: tracing::Span,
 }
 
+/// True when this forward's KV positions cross a multiple of 8,192 — the
+/// depths at which the K/V cache byte size passes an exact power of two and
+/// Metal generation corrupts without a forced sync (see `forward`).
+fn crosses_kv_boundary(index_pos: usize, seq_len: usize) -> bool {
+    const STRIDE: usize = 8_192;
+    let end = index_pos + seq_len; // kv length after this forward
+    // The crossing step itself, plus the step that starts exactly on the
+    // boundary — together the two steps the bisection proved sufficient.
+    (index_pos / STRIDE) != (end / STRIDE) || (index_pos % STRIDE == 0 && index_pos != 0)
+}
+
+/// Debug probe (`CANDLE_QWEN2_LAYER_STATS=<lo>-<hi>`): true when the KV
+/// positions [index_pos, end) touched by this forward intersect [lo, hi].
+fn layer_stats_enabled(index_pos: usize, end: usize) -> bool {
+    static RANGE: std::sync::OnceLock<Option<(usize, usize)>> = std::sync::OnceLock::new();
+    let range = RANGE.get_or_init(|| {
+        let v = std::env::var("CANDLE_QWEN2_LAYER_STATS").ok()?;
+        let (lo, hi) = v.split_once('-')?;
+        Some((lo.trim().parse().ok()?, hi.trim().parse().ok()?))
+    });
+    match range {
+        Some((lo, hi)) => index_pos < *hi && end > *lo,
+        None => false,
+    }
+}
+
+/// Emit one stats line for a probed tensor: max |x| and a NaN flag (a NaN
+/// anywhere poisons the sum). Costs one small readback per call — which is
+/// also a forced GPU sync, the probe's real lever: the corruption at
+/// kv = 8,192 vanishes when these syncs run, so the probe doubles as a
+/// bisection tool for the missing-synchronization site. Only runs inside
+/// the env-gated position window; `CANDLE_QWEN2_LAYER_STATS_TAPS` (comma
+/// list of attn,mlp,out) and `CANDLE_QWEN2_LAYER_STATS_LAYERS=<lo>-<hi>`
+/// narrow it further.
+fn layer_stats(index_pos: usize, layer: usize, tag: &str, x: &Tensor) -> Result<()> {
+    static TAPS: std::sync::OnceLock<Option<Vec<String>>> = std::sync::OnceLock::new();
+    let taps = TAPS.get_or_init(|| {
+        std::env::var("CANDLE_QWEN2_LAYER_STATS_TAPS")
+            .ok()
+            .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+    });
+    if let Some(taps) = taps {
+        if !taps.iter().any(|t| t == tag) {
+            return Ok(());
+        }
+    }
+    static LAYERS: std::sync::OnceLock<Option<(usize, usize)>> = std::sync::OnceLock::new();
+    let layers = LAYERS.get_or_init(|| {
+        let v = std::env::var("CANDLE_QWEN2_LAYER_STATS_LAYERS").ok()?;
+        let (lo, hi) = v.split_once('-')?;
+        Some((lo.trim().parse().ok()?, hi.trim().parse().ok()?))
+    });
+    if let Some((lo, hi)) = layers {
+        if layer < *lo || layer >= *hi {
+            return Ok(());
+        }
+    }
+    let flat = x.flatten_all()?.to_dtype(DType::F32)?;
+    let max_abs = flat.abs()?.max(0)?.to_scalar::<f32>()?;
+    let sum = flat.sum(0)?.to_scalar::<f32>()?;
+    eprintln!(
+        "[layer-stats] pos={index_pos} layer={layer} {tag} max_abs={max_abs:.4e} nan={}",
+        !sum.is_finite()
+    );
+    Ok(())
+}
+
 fn precomput_freqs_cis(
     head_dim: usize,
     freq_base: f32,
@@ -322,20 +389,43 @@ impl ModelWeights {
             Some(self.mask(seq_len, index_pos, x.device())?)
         };
         let _enter = self.span.enter();
+        let probe = layer_stats_enabled(index_pos, index_pos + seq_len);
+        // Workaround for deterministic Metal corruption when the KV depth
+        // crosses a multiple of 8,192: without a forced sync early in the
+        // crossing step, generation degrades into garbage from that position
+        // on (a missed dependency under HazardTrackingModeUntracked; the
+        // fixed encoder schedule makes the stale read deterministic).
+        // Empirically, synchronizing after the first two layers' outputs of
+        // the crossing step fully restores correct generation; steps that
+        // don't cross a boundary are untouched. See yatima's
+        // notes/metal-kv-cliff.md for the bisection.
+        let kv_sync = x.device().is_metal() && crosses_kv_boundary(index_pos, seq_len);
         let mut layer_in = self.tok_embeddings.forward(x)?;
-        for layer in self.layers.iter_mut() {
+        for (li, layer) in self.layers.iter_mut().enumerate() {
             let x = layer_in;
             let residual = &x;
             let x = layer.attention_norm.forward(&x)?;
             let attn = layer.forward_attn(&x, mask.as_ref(), index_pos)?;
+            if probe {
+                layer_stats(index_pos, li, "attn", &attn)?;
+            }
             let x = (attn + residual)?;
+            if kv_sync && li < 2 {
+                x.device().synchronize()?;
+            }
 
             // MLP
             let _enter = layer.span_mlp.enter();
             let residual = &x;
             let x = layer.ffn_norm.forward(&x)?;
             let x = layer.mlp.forward(&x)?;
+            if probe {
+                layer_stats(index_pos, li, "mlp", &x)?;
+            }
             let x = (x + residual)?;
+            if probe {
+                layer_stats(index_pos, li, "out", &x)?;
+            }
             layer_in = x
         }
         let x = self.norm.forward(&layer_in)?;
